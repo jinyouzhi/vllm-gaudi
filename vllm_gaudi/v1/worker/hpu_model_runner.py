@@ -568,13 +568,6 @@ def _init_mamba_split_weights(model):
             module._init_split_weights()
 
 
-def apply_model_specific_patches(model_runner):
-    """The function applies model-specific monkey patches."""
-    maybe_set_chunked_attention_layers(model_runner)
-    patch_llama4_get_attn_scale(model_runner.model)
-    _init_mamba_split_weights(model_runner.model)
-
-
 def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num_scheduled_tokens,
                                          mamba_block_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -602,6 +595,13 @@ def compute_prefix_caching_block_indices(num_reqs: int, num_computed_tokens, num
         block_idx_first_scheduled_token,
         block_idx_last_scheduled_token,
     )
+
+
+def apply_model_specific_patches(model_runner):
+    """The function applies model-specific monkey patches."""
+    maybe_set_chunked_attention_layers(model_runner)
+    patch_llama4_get_attn_scale(model_runner.model)
+    _init_mamba_split_weights(model_runner.model)
 
 
 class HpuKVConnectorModelRunnerMixin(KVConnectorModelRunnerMixin):
@@ -1066,7 +1066,8 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         os.environ["VLLM_COMPACT_GDN"] = "1"
                 if os.environ.get("VLLM_COMPACT_GDN", "0") in ("1", "true") \
                         and self.vllm_config.cache_config.enable_prefix_caching:
-                    logger.warning("Compact GDN mode does not support prefix caching.")
+                    logger.warning("Compact GDN mode does not support prefix caching. Auto-disabling compact GDN.")
+                    os.environ["VLLM_COMPACT_GDN"] = "0"
                 logger.info(
                     "GDN layers detected (%d): "
                     "VLLM_USE_HYBRID_CACHE=%s, "
@@ -2449,19 +2450,46 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
 
             req_indices = [self.input_batch.req_id_to_index[req_id] for req_id in contents.req_ids]
+            num_prefill_reqs = len(contents.req_ids)
 
-            if self.use_prefix_caching:
+            if self.use_prefix_caching and not self._compact_gdn_group_ids:
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
                                                                        target_bs)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         target_bs)
             else:
-                zeros = [0] * len(req_indices)
-                load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, target_bs)
+                # Non-prefix-caching or compact GDN: use single index for both load/store
+                all_state_indices_cpu = []
+                for group_idx in range(len(self.input_batch.block_table.block_tables)):
+                    state_indices_cpu = torch.zeros(num_prefill_reqs, dtype=torch.int32)
 
-            if self.use_prefix_caching:
-                assert len(contents.req_ids) == 1
+                    if group_idx in self._compact_gdn_group_ids:
+                        g_offset = self._compact_gdn_group_offset[group_idx]
+                        for i, req_id in enumerate(contents.req_ids):
+                            base_slot = self._gdn_req_to_base_slot[req_id]
+                            state_indices_cpu[i] = base_slot * self._num_gdn_groups + g_offset + 1
+                    else:
+                        block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
+                        for i, req_id in enumerate(contents.req_ids):
+                            req_idx = self.input_batch.req_id_to_index[req_id]
+                            first_block = block_table_cpu_tensor[req_idx, 0]
+                            state_indices_cpu[i] = first_block
+
+                    if num_prefill_reqs < target_bs:
+                        padding = torch.full((target_bs - num_prefill_reqs, ),
+                                             self._MAMBA_PAD_BLOCK_ID,
+                                             dtype=torch.int32,
+                                             device='cpu')
+                        state_indices_cpu = torch.cat([state_indices_cpu, padding])
+
+                    all_state_indices_cpu.append(state_indices_cpu)
+
+                load_state_indices_cpu = store_state_indices_cpu = \
+                    torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
+
+            if self.use_prefix_caching and not self._compact_gdn_group_ids:
+                assert num_prefill_reqs == 1, \
+                    "Prefix caching for mamba-like layers currently supports single-request prefill only"
                 assert mamba_block_size % self.mamba_chunk_size == 0
                 assert context_lens[0] % self.mamba_chunk_size == 0
 
@@ -2470,9 +2498,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 max_cached_blocks = cdiv(target_seq, mamba_block_size) + 1
 
                 # chunk_offset: scheduled-chunk index of the last chunk
-                # of the first block to cache. Block boundaries fall at
-                # absolute chunk (block+1)*chunk_stride-1; subtract the
-                # first scheduled absolute chunk to get the local index.
+                # of the first block to cache.
                 first_sched_chunk_abs = context_lens[0] // self.mamba_chunk_size
                 first_block = block_idx_first_scheduled_token_cpu[0].item()
                 chunk_offset = (first_block + 1) * chunk_stride - 1 - first_sched_chunk_abs
@@ -2555,7 +2581,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             padding_mask_flat = async_h2d_copy(padding_mask_flat_cpu, device=self.device)
             query_start_loc_p = async_h2d_copy(query_start_loc_p_cpu, dtype=torch.int32)
 
-            if self.use_prefix_caching:
+            if self.use_prefix_caching and not self._compact_gdn_group_ids:
                 blocks_caching_range = async_h2d_copy(all_blocks_caching_ranges_cpu, device=self.device)
                 mamba_chunks_to_block_mapping = async_h2d_copy(all_mamba_chunks_to_block_mappings_cpu,
                                                                device=self.device)
@@ -2849,15 +2875,34 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 )
 
             req_indices = list(range(num_decodes))
-            if self.use_prefix_caching:
+            if self.use_prefix_caching and not self._compact_gdn_group_ids:
                 load_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_computed_token_cpu,
                                                                        padded_batch_size)
                 store_state_indices_cpu = self.prepare_mamba_state_idxs(req_indices, block_idx_last_scheduled_token_cpu,
                                                                         padded_batch_size)
             else:
-                zeros = [0] * len(req_indices)
+                all_state_indices_cpu = []
+                for group_idx in range(len(self.input_batch.block_table.block_tables)):
+                    if group_idx in self._compact_gdn_group_ids:
+                        g_offset = self._compact_gdn_group_offset[group_idx]
+                        base_slots = torch.tensor(
+                            [self._gdn_req_to_base_slot[self.input_batch.req_ids[i]] for i in range(num_decodes)],
+                            dtype=torch.int32)
+                        state_indices_cpu = base_slots * self._num_gdn_groups + g_offset + 1
+                    else:
+                        block_table_cpu_tensor = self.input_batch.block_table[group_idx].get_cpu_tensor()
+                        state_indices_cpu = block_table_cpu_tensor[:num_decodes, 0].clone()
+                    if num_decodes < padded_batch_size:
+                        padding = torch.full((padded_batch_size - num_decodes, ),
+                                             self._MAMBA_PAD_BLOCK_ID,
+                                             dtype=torch.int32,
+                                             device='cpu')
+                        state_indices_cpu = torch.cat([state_indices_cpu, padding])
+
+                    all_state_indices_cpu.append(state_indices_cpu)
+
                 load_state_indices_cpu = store_state_indices_cpu = \
-                    self.prepare_mamba_state_idxs(req_indices, zeros, padded_batch_size)
+                    torch.stack(all_state_indices_cpu, dim=0)  # Shape: [num_groups, target_bs]
 
             seq_lens_cpu = torch.tensor(num_tokens_per_req, dtype=torch.int32, device='cpu', pin_memory=self.pin_memory)
 

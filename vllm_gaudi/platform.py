@@ -46,6 +46,17 @@ def is_qwen3_5_hybrid_model(model_config: Optional[ModelConfig]) -> bool:
     return any(arch in QWEN3_5_HYBRID_ARCHS for arch in architectures)
 
 
+def has_block_type_layers(model_config: Optional[ModelConfig], parallel_config, block_types: tuple[str, ...]) -> bool:
+    if model_config is None:
+        return False
+
+    get_num_layers = getattr(model_config, "get_num_layers_by_block_type", None)
+    if get_num_layers is None:
+        return False
+
+    return any(get_num_layers(parallel_config, block_type) > 0 for block_type in block_types)
+
+
 class HpuPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "hpu"
@@ -155,8 +166,14 @@ class HpuPlatform(Platform):
                     aligned_block_size,
                 )
                 cache_config.block_size = aligned_block_size
-                if cache_config.mamba_cache_mode == "align":
-                    cache_config.mamba_block_size = aligned_block_size
+
+            # Always re-align mamba_block_size to block_size in "align" mode.
+            # HybridAttentionMambaModelConfig runs before check_and_update_config
+            # and may have set mamba_block_size to the pre-HPU block_size (e.g. 16).
+            # After HPU overrides block_size to 128, mamba_block_size must match
+            # to satisfy hash_block_size divisibility in HybridKVCacheCoordinator.
+            if cache_config.mamba_cache_mode == "align":
+                cache_config.mamba_block_size = cache_config.block_size
 
             # Recompute mamba_page_size_padded so it is a multiple of
             # the HPU attention page size.
@@ -214,6 +231,13 @@ class HpuPlatform(Platform):
         if get_config().VLLM_CONTIGUOUS_PA:
             logger.warning("Using Contiguous PA, disabling prefix caching")
             vllm_config.cache_config.enable_prefix_caching = False
+
+        if (vllm_config.cache_config.enable_prefix_caching and not vllm_config.scheduler_config.enable_chunked_prefill
+                and has_block_type_layers(vllm_config.model_config, parallel_config,
+                                          ("gdn_attention", "linear_attention"))):
+            logger.warning("[HPU] Prefix caching for GDN/linear_attention requires chunked prefill. "
+                           "Enabling chunked prefill.")
+            vllm_config.scheduler_config.enable_chunked_prefill = True
 
         if (vllm_config.cache_config.enable_prefix_caching and vllm_config.cache_config.mamba_cache_mode == "all"):
             vllm_config.cache_config.mamba_cache_mode = "align"
