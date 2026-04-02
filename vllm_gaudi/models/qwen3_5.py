@@ -28,6 +28,21 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     return core_attn_out
 
 
+@torch._dynamo.disable
+def _save_ssm_state_prefix_cached(core_attn_out, all_chunk_states, ssm_state,
+                                   mamba_chunks_to_block_mapping):
+    """Persist per-chunk GDN states into ssm_state cache for prefix caching.
+
+    all_chunk_states: [num_chunks, S, H, V, K] from hpu_chunk_gated_delta_rule.
+    mamba_chunks_to_block_mapping: maps each chunk index to its cache block.
+    """
+    # all_chunk_states shape: [num_chunks, S, H, V, K]
+    # For single-request prefill (S=1), squeeze the S dim for indexing.
+    states = all_chunk_states.squeeze(1) if all_chunk_states.dim() == 5 else all_chunk_states
+    ssm_state[mamba_chunks_to_block_mapping] = states.to(device=ssm_state.device, dtype=ssm_state.dtype)
+    return core_attn_out
+
+
 class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
 
     def __init__(self, *args, **kwargs):
@@ -61,10 +76,12 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         value = value.reshape(1, value.size(0), -1, self.head_v_dim).contiguous()
         return query, key, value
 
-    def _resolve_state_indices(self, attn_metadata):
-        """Resolve state_indices_tensor, handling 2-D cache-group case."""
-        indices = attn_metadata.state_indices_tensor
-        if indices is not None and indices.dim() > 1:
+    def _resolve_indices(self, attn_metadata, attr_name):
+        """Resolve load/store indices tensor, handling 2-D cache-group case."""
+        indices = getattr(attn_metadata, attr_name, None)
+        if indices is None:
+            return None
+        if indices.dim() > 1:
             cg = self.cache_group_idx
             assert cg is not None
             indices = indices.index_select(0, cg.view(1)).squeeze(0)
@@ -79,10 +96,12 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         forward_context = get_forward_context()
         attn_metadata = forward_context.attn_metadata
         if attn_metadata is None:
-            return (False, None, None, None, None, None, None, 0, 0, 0, 0, None)
+            return (False, None, None, None, None, None, None, None,
+                    0, 0, 0, 0, None, None, None, None, False)
 
         is_prompt = bool(getattr(attn_metadata, "is_prompt", False))
-        state_indices = self._resolve_state_indices(attn_metadata)
+        load_indices = self._resolve_indices(attn_metadata, "load_indices_tensor")
+        store_indices = self._resolve_indices(attn_metadata, "store_indices_tensor")
 
         self_kv_cache = self.kv_cache[0]
         conv_state = self_kv_cache[0]
@@ -92,8 +111,23 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         has_initial_state = getattr(attn_metadata, "has_initial_states_p", None)
         padding_mask_flat = getattr(attn_metadata, "padding_mask_flat", None)
 
+        enable_prefix_caching = (self.cache_config is not None
+                                 and self.cache_config.enable_prefix_caching)
+
+        # Prefix caching metadata
+        blocks_caching_range = None
+        mamba_chunks_to_block_mapping = None
+        seqlens_offsets_for_blocks = None
+        if enable_prefix_caching and is_prompt:
+            blocks_caching_range = self._resolve_indices(
+                attn_metadata, "blocks_caching_range")
+            mamba_chunks_to_block_mapping = self._resolve_indices(
+                attn_metadata, "mamba_chunks_to_block_mapping")
+            seqlens_offsets_for_blocks = getattr(
+                attn_metadata, "seqlens_offsets_for_blocks", None)
+
         if not is_prompt:
-            num_decodes = (state_indices.numel() if state_indices is not None else
+            num_decodes = (load_indices.numel() if load_indices is not None else
                            (query_start_loc.numel() - 1 if query_start_loc is not None else num_tokens))
         else:
             num_decodes = 0
@@ -104,15 +138,18 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         prefill_num_seqs = 0
         prefill_seq_len = 0
         initial_state = None
-        if is_prompt and state_indices is not None:
-            prefill_num_seqs = int(state_indices.numel())
+        if is_prompt and load_indices is not None:
+            prefill_num_seqs = int(load_indices.numel())
             prefill_seq_len = (num_tokens // prefill_num_seqs if prefill_num_seqs > 0 else 0)
-            initial_state = ssm_state[state_indices].contiguous()
+            initial_state = ssm_state[load_indices].contiguous()
             if has_initial_state is not None:
                 initial_state[~has_initial_state.bool(), ...] = 0
 
-        return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
-                num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state)
+        return (is_prompt, conv_state, ssm_state, load_indices, store_indices,
+                query_start_loc, has_initial_state, padding_mask_flat,
+                num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
+                initial_state, blocks_caching_range, mamba_chunks_to_block_mapping,
+                seqlens_offsets_for_blocks, enable_prefix_caching)
 
     def forward(
         self,
@@ -129,9 +166,11 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
         num_tokens = hidden_states.size(0)
 
         # === Metadata extraction (natural graph break) ===============
-        (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
+        (is_prompt, conv_state, ssm_state, load_indices, store_indices,
+         query_start_loc, has_initial_state, padding_mask_flat,
          num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len,
-         initial_state) = self._extract_metadata(num_tokens)
+         initial_state, blocks_caching_range, mamba_chunks_to_block_mapping,
+         seqlens_offsets_for_blocks, enable_prefix_caching) = self._extract_metadata(num_tokens)
 
         # === Part 1: Input Projection ================================
         mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
@@ -173,14 +212,13 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 activation=self.activation,
                 conv_states=conv_state,
                 has_initial_state=has_initial_state,
-                cache_indices=state_indices,
-                block_idx_first_scheduled_token=None,
-                block_idx_last_scheduled_token=None,
-                initial_state_idx=None,
-                query_start_loc=query_start_loc,
-                block_size_to_align=mamba_block_size,
-                num_computed_tokens=None,
+                enable_prefix_caching=enable_prefix_caching,
+                load_cache_indices=load_indices,
+                store_cache_indices=store_indices,
+                blocks_caching_range=blocks_caching_range,
+                seqlens_offsets_for_blocks=seqlens_offsets_for_blocks,
                 metadata=None,
+                query_start_loc=query_start_loc,
                 is_prompt=True,
             ).transpose(0, 1)
 
@@ -194,27 +232,50 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 g = g * token_mask_h
                 beta = beta * token_mask_h
 
-            core_attn_out_result, final_state = hpu_chunk_gated_delta_rule(
-                q=query,
-                k=key,
-                v=value,
-                g=g,
-                beta=beta,
-                initial_state=initial_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                chunk_size=self.mamba_chunk_size,
-                prefill_num_seqs=prefill_num_seqs,
-                prefill_seq_len=prefill_seq_len,
-            )
-            # State save in dynamo-disabled wrapper — index_copy_ is
-            # silently dropped by HPU torch.compile on aliased tensors.
-            core_attn_out_result = _save_ssm_state(
-                core_attn_out_result,
-                final_state,
-                ssm_state,
-                state_indices,
-            )
+            if enable_prefix_caching:
+                core_attn_out_result, final_state, all_chunk_states = \
+                    hpu_chunk_gated_delta_rule(
+                        q=query,
+                        k=key,
+                        v=value,
+                        g=g,
+                        beta=beta,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        use_qk_l2norm_in_kernel=True,
+                        chunk_size=self.mamba_chunk_size,
+                        prefill_num_seqs=prefill_num_seqs,
+                        prefill_seq_len=prefill_seq_len,
+                        output_all_chunk_states=True,
+                    )
+                core_attn_out_result = _save_ssm_state_prefix_cached(
+                    core_attn_out_result,
+                    all_chunk_states,
+                    ssm_state,
+                    mamba_chunks_to_block_mapping,
+                )
+            else:
+                core_attn_out_result, final_state = hpu_chunk_gated_delta_rule(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    chunk_size=self.mamba_chunk_size,
+                    prefill_num_seqs=prefill_num_seqs,
+                    prefill_seq_len=prefill_seq_len,
+                )
+                # State save in dynamo-disabled wrapper — index_copy_ is
+                # silently dropped by HPU torch.compile on aliased tensors.
+                core_attn_out_result = _save_ssm_state(
+                    core_attn_out_result,
+                    final_state,
+                    ssm_state,
+                    store_indices,
+                )
 
             non_spec_out = core_attn_out_result.squeeze(0)
             core_attn_out[:non_spec_out.shape[0]] = non_spec_out
@@ -230,11 +291,10 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 weight=conv_weights,
                 bias=self.conv1d.bias,
                 activation=self.activation,
-                conv_state_indices=(state_indices[:num_decodes] if state_indices is not None else state_indices),
-                block_idx_last_scheduled_token=None,
+                load_cache_indices=(load_indices[:num_decodes] if load_indices is not None else load_indices),
+                store_cache_indices=(store_indices[:num_decodes] if store_indices is not None else store_indices),
                 initial_state_idx=None,
                 query_start_loc=query_start_loc,
-                validate_data=False,
             )
 
             query, key, value = self.rearrange_mixed_qkv(mixed_qkv_conv)
@@ -247,7 +307,8 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                     cu_seqlens=(
                         query_start_loc[:num_decodes + 1]
                         if query_start_loc is not None else None),
-                    ssm_state_indices=state_indices,
+                    ssm_state_indices=load_indices,
+                    dst_ssm_state_indices=store_indices,
                     use_qk_l2norm_in_kernel=True,
                 )
 

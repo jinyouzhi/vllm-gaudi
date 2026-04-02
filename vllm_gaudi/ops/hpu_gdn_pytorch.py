@@ -210,7 +210,8 @@ def hpu_chunk_gdr_phase_b(
     Kdim: int,
     Vdim: int,
     output_final_state: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    output_all_chunk_states: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Phase B: sequential loop — stages 5-6 (state-dependent).
 
     Dispatches between optimized (hoisted precompute) and legacy
@@ -248,6 +249,7 @@ def hpu_chunk_gdr_phase_b(
         Kdim,
         Vdim,
         output_final_state,
+        output_all_chunk_states=output_all_chunk_states,
     )
 
 
@@ -272,6 +274,7 @@ def _hpu_chunk_gdr_phase_b_optimized(
     Kdim: int,
     Vdim: int,
     output_final_state: bool,
+    output_all_chunk_states: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Optimized Phase B: chunk-local precompute hoisted out of the loop.
 
@@ -325,15 +328,24 @@ def _hpu_chunk_gdr_phase_b_optimized(
 
     state_t = init_state.to(compute_dtype).transpose(-1, -2)  # [S,H,K,V]
 
+    if output_all_chunk_states:
+        all_chunk_states = []
     for ci in range(num_chunks):
         core_h[:, ci].add_(torch.matmul(C_h[:, ci], state_t))
         state_t = torch.matmul(M_full[:, ci], state_t) + N_t[:, ci]
+        if output_all_chunk_states:
+            all_chunk_states.append(state_t.transpose(-1, -2).contiguous().to(init_state.dtype))
 
     out = _eager_reshape_output(core_h, S, padded_len, seq_len, H, Vdim)
 
     final_state = None
     if output_final_state:
         final_state = state_t.transpose(-1, -2).contiguous().to(init_state.dtype)
+
+    if output_all_chunk_states:
+        # Stack into [num_chunks, S, H, V, K]
+        all_chunk_states = torch.stack(all_chunk_states, dim=0)
+        return out, final_state, all_chunk_states
 
     return out, final_state
 
@@ -543,6 +555,7 @@ def hpu_fused_recurrent_gated_delta_rule(
     inplace_final_state: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
+    dst_ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -628,7 +641,14 @@ def hpu_fused_recurrent_gated_delta_rule(
         out_batch = torch.matmul(h_batch, q_s.unsqueeze(-1)).squeeze(-1)
 
         # Direct index_copy_ (no eager wrapper for this test).
-        final_state.index_copy_(0, sidx, h_batch.to(final_state.dtype))
+        # Use dst_ssm_state_indices for write-back if provided (prefix caching).
+        if dst_ssm_state_indices is not None:
+            dst_idx = dst_ssm_state_indices.reshape(-1).to(dtype=torch.long, device=device)
+            num_slots = final_state.shape[0]
+            dst_idx = torch.remainder(dst_idx, num_slots)
+            final_state.index_copy_(0, dst_idx, h_batch.to(final_state.dtype))
+        else:
+            final_state.index_copy_(0, sidx, h_batch.to(final_state.dtype))
         out_full = out_batch.to(v.dtype)
 
         out_result = out_full.unsqueeze(0) if cu_seqlens is not None else out_full.view(B, T, HV, Vdim)
@@ -646,6 +666,7 @@ def hpu_fused_recurrent_gated_delta_rule(
         inplace_final_state,
         cu_seqlens,
         ssm_state_indices,
+        dst_ssm_state_indices,
         use_qk_l2norm_in_kernel,
         B,
         T,
@@ -669,6 +690,7 @@ def _recurrent_general_path(
     inplace_final_state: bool,
     cu_seqlens: torch.LongTensor | None,
     ssm_state_indices: torch.Tensor | None,
+    dst_ssm_state_indices: torch.Tensor | None,
     use_qk_l2norm_in_kernel: bool,
     B: int,
     T: int,
@@ -707,12 +729,18 @@ def _recurrent_general_path(
 
     state_indices_tensor: torch.Tensor | None = None
     state_indices_valid: torch.Tensor | None = None
+    dst_indices_tensor: torch.Tensor | None = None
     if ssm_state_indices is not None:
         state_indices_tensor = ssm_state_indices.reshape(-1).to(
             dtype=torch.long,
             device=state_work.device,
         )
         state_indices_valid = ((state_indices_tensor >= 0) & (state_indices_tensor < state_work.shape[0]))
+    if dst_ssm_state_indices is not None:
+        dst_indices_tensor = dst_ssm_state_indices.reshape(-1).to(
+            dtype=torch.long,
+            device=state_work.device,
+        )
 
     num_state_indices = (int(state_indices_tensor.shape[0]) if state_indices_tensor is not None else 0)
     # trip count = num_seqs (batch bucket); recompile per batch bucket
@@ -771,7 +799,12 @@ def _recurrent_general_path(
                 h_state.unsqueeze(0),
                 prev_state,
             )
-            state_work.index_copy_(0, safe_idx, updated_state)
+            # Use dst_indices_tensor for write-back if provided (prefix caching).
+            if dst_indices_tensor is not None and seq_id < dst_indices_tensor.shape[0]:
+                dst_id_t = dst_indices_tensor[seq_id:seq_id + 1]
+                state_work.index_copy_(0, dst_id_t, updated_state)
+            else:
+                state_work.index_copy_(0, safe_idx, updated_state)
         else:
             state_work[seq_id] = h_state
 
@@ -800,7 +833,8 @@ def hpu_chunk_gated_delta_rule(
     # NOTE: neumann_iters impacts accuracy. 14 is used for Qwen3.5; other
     # models may need re-tuning. See _hpu_solve_lower_triangular_batched docs.
     neumann_iters: int = 14,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    output_all_chunk_states: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """PyTorch replacement for chunk_gated_delta_rule.
 
     This path intentionally mirrors upstream prefill call semantics without
@@ -854,7 +888,7 @@ def hpu_chunk_gated_delta_rule(
             neumann_iters=neumann_iters,
         )
 
-        out, final_state = hpu_chunk_gdr_phase_b(
+        result = hpu_chunk_gdr_phase_b(
             u_all,
             w_all,
             q_chunks,
@@ -869,11 +903,20 @@ def hpu_chunk_gated_delta_rule(
             Kdim=Kdim_c,
             Vdim=Vdim_c,
             output_final_state=output_final_state,
+            output_all_chunk_states=output_all_chunk_states,
         )
+
+        if output_all_chunk_states:
+            out, final_state, all_chunk_states = result
+        else:
+            out, final_state = result
+            all_chunk_states = None
 
         out = out.to(q.dtype).view(B, T, H_c, Vdim)
         if final_state is not None and initial_state is not None:
             final_state = final_state.to(initial_state.dtype)
+        if output_all_chunk_states:
+            return out, final_state, all_chunk_states
         return out, final_state
 
     # ---- Legacy paths (cu_seqlens / non-bucketed) ----
