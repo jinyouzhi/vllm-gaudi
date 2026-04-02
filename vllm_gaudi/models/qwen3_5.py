@@ -1,5 +1,8 @@
+import os
+
 import torch
 import vllm.model_executor.models.qwen3_5 as qwen3_5_module
+from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from vllm.forward_context import get_forward_context
 
@@ -14,6 +17,10 @@ from vllm_gaudi.ops.hpu_gdn_pytorch import (
 )
 
 
+logger = init_logger(__name__)
+_LOG_GDN_PROMPT_LENGTH = os.environ.get("VLLM_GDN_LOG_PROMPT_LENGTH", "0") == "1"
+
+
 @torch._dynamo.disable
 def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     """Persist GDN final_state into ssm_state cache for chunked prefill.
@@ -26,6 +33,35 @@ def _save_ssm_state(core_attn_out, final_state, ssm_state, state_indices):
     safe_si = torch.remainder(state_indices, ssm_state.shape[0]).long()
     ssm_state.index_copy_(0, safe_si, final_state.to(device=ssm_state.device, dtype=ssm_state.dtype))
     return core_attn_out
+
+
+@torch._dynamo.disable
+def _log_prompt_runtime(attn_metadata, num_tokens, prefill_num_seqs, prefill_seq_len, padding_mask_flat):
+    seq_lens_tensor = getattr(attn_metadata, "seq_lens_tensor", None)
+    context_lens_tensor = getattr(attn_metadata, "context_lens_tensor", None)
+
+    if seq_lens_tensor is not None:
+        query_lens = seq_lens_tensor[:prefill_num_seqs].detach().cpu().tolist()
+    else:
+        query_lens = [prefill_seq_len] * prefill_num_seqs
+
+    if context_lens_tensor is not None:
+        context_lens = context_lens_tensor[:prefill_num_seqs].detach().cpu().tolist()
+    else:
+        context_lens = [0] * prefill_num_seqs
+
+    total_prompt_lens = [context_len + query_len for context_len, query_len in zip(context_lens, query_lens)]
+    valid_tokens = int(padding_mask_flat.sum().item()) if padding_mask_flat is not None else num_tokens
+
+    logger.warning(
+        "GDN prompt runtime: batch=%s padded_tokens=%s valid_tokens=%s query_lens=%s context_lens=%s total_prompt_lens=%s",
+        prefill_num_seqs,
+        num_tokens,
+        valid_tokens,
+        query_lens,
+        context_lens,
+        total_prompt_lens,
+    )
 
 
 class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
@@ -110,6 +146,14 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
             initial_state = ssm_state[state_indices].contiguous()
             if has_initial_state is not None:
                 initial_state[~has_initial_state.bool(), ...] = 0
+            if _LOG_GDN_PROMPT_LENGTH:
+                _log_prompt_runtime(
+                    attn_metadata,
+                    num_tokens,
+                    prefill_num_seqs,
+                    prefill_seq_len,
+                    padding_mask_flat,
+                )
 
         return (is_prompt, conv_state, ssm_state, state_indices, query_start_loc, has_initial_state, padding_mask_flat,
                 num_decodes, mamba_block_size, prefill_num_seqs, prefill_seq_len, initial_state)
@@ -206,6 +250,7 @@ class HPUQwen3_5GatedDeltaNet(Qwen3_5GatedDeltaNet):
                 chunk_size=self.mamba_chunk_size,
                 prefill_num_seqs=prefill_num_seqs,
                 prefill_seq_len=prefill_seq_len,
+                token_mask_flat=token_mask_flat,
             )
             # State save in dynamo-disabled wrapper — index_copy_ is
             # silently dropped by HPU torch.compile on aliased tensors.

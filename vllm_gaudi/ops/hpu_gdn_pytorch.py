@@ -97,6 +97,7 @@ def hpu_chunk_gdr_preprocess(
     g_active = gf[:total_tokens]
     padded_len = num_chunks * chunk_size
     if padded_len > seq_len:
+        print(f"{padded_len=}, {seq_len=}, padding g from {g_active.shape} to {(S, padded_len, gf.shape[1])}")
         g_block = g_active.reshape(S, seq_len, -1)
         pad_block = torch.zeros(S, padded_len - seq_len, gf.shape[1], dtype=gf.dtype, device=device)
         g_block = torch.cat([g_block, pad_block], dim=1)
@@ -210,6 +211,7 @@ def hpu_chunk_gdr_phase_b(
     Kdim: int,
     Vdim: int,
     output_final_state: bool,
+    token_mask_flat: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Phase B: sequential loop — stages 5-6 (state-dependent).
 
@@ -248,6 +250,7 @@ def hpu_chunk_gdr_phase_b(
         Kdim,
         Vdim,
         output_final_state,
+        token_mask_flat,
     )
 
 
@@ -272,6 +275,7 @@ def _hpu_chunk_gdr_phase_b_optimized(
     Kdim: int,
     Vdim: int,
     output_final_state: bool,
+    token_mask_flat: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Optimized Phase B: chunk-local precompute hoisted out of the loop.
 
@@ -323,11 +327,33 @@ def _hpu_chunk_gdr_phase_b_optimized(
     k_eye = torch.eye(Kdim, dtype=compute_dtype, device=device).view(1, 1, 1, Kdim, Kdim)
     M_full = alpha * k_eye - R.transpose(-1, -2)  # [S,C,H,K,K]
 
-    state_t = init_state.to(compute_dtype).transpose(-1, -2)  # [S,H,K,V]
+    if token_mask_flat is not None:
+        token_mask_chunks = token_mask_flat.reshape(S, num_chunks, -1)
+        chunk_valid_state = token_mask_chunks.any(dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        token_mask_h = token_mask_chunks.unsqueeze(2).unsqueeze(-1).to(compute_dtype)
 
+        M_full = M_full * chunk_valid_state.to(compute_dtype) + k_eye * (~chunk_valid_state).to(compute_dtype)
+        N_t = N_t * chunk_valid_state.to(compute_dtype)
+        C_h = C_h * token_mask_h
+        core_h = core_h * token_mask_h
+
+
+    state_t = init_state.to(compute_dtype).transpose(-1, -2)  # [S,H,K,V]
+    # print(f"before {state_t[0, -1, ...]=}")
+    # print(f"before {state_t=}")
     for ci in range(num_chunks):
+        #print(f"{state_t=}, {state_t.shape=}")
+        # print(f"{state_t.shape=}")
+        if not token_mask_chunks[:, ci].all():
+            print(f"Chunk {ci} has invalid tokens, applying mask. Valid tokens in chunk: {token_mask_chunks[:, ci].sum().item()}")
+            # print(f"{M_full[:, ci]=}, {N_t[:, ci]=}, {C_h[:, ci]=}, {core_h[:, ci]=}")
+            print(f"before {state_t=}")
         core_h[:, ci].add_(torch.matmul(C_h[:, ci], state_t))
         state_t = torch.matmul(M_full[:, ci], state_t) + N_t[:, ci]
+        if not token_mask_chunks[:, ci].all():
+            print(f"after {state_t=}, {state_t.shape=}")
+    # print(f"before {state_t[0, -1, ...]=}")
+    # print(f"after {state_t=}")
 
     out = _eager_reshape_output(core_h, S, padded_len, seq_len, H, Vdim)
 
@@ -801,6 +827,7 @@ def hpu_chunk_gated_delta_rule(
     # NOTE: neumann_iters impacts accuracy. 14 is used for Qwen3.5; other
     # models may need re-tuning. See _hpu_solve_lower_triangular_batched docs.
     neumann_iters: int = 14,
+    token_mask_flat: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """PyTorch replacement for chunk_gated_delta_rule.
 
@@ -870,6 +897,7 @@ def hpu_chunk_gated_delta_rule(
             Kdim=Kdim_c,
             Vdim=Vdim_c,
             output_final_state=output_final_state,
+            token_mask_flat=token_mask_flat,
         )
 
         out = out.to(q.dtype).view(B, T, H_c, Vdim)
