@@ -1,4 +1,7 @@
 import torch
+from vllm.model_executor.layers.mamba.gdn_linear_attn import (
+    GatedDeltaNetAttention,
+)
 from vllm.model_executor.models.qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextSparseMoeBlock,
@@ -8,6 +11,7 @@ from vllm.distributed import tensor_model_parallel_all_gather
 
 # Save original forwards before patching
 _orig_qwen3next_attention_forward = Qwen3NextAttention.forward
+_orig_gdn_forward_cuda = GatedDeltaNetAttention.forward_cuda
 
 
 # ====================================================================
@@ -101,7 +105,32 @@ def _hpu_qwen3next_sparse_moe_forward(
 
 
 # ====================================================================
+# 3. GatedDeltaNetAttention.forward_cuda  (linear-attention / GDN layers)
+#    Shared by Qwen3-Next and Qwen3.5. Upstream assumes 2-D
+#    (num_tokens, H) inputs and allocates core_attn_out using
+#    hidden_states.size(0); on HPU the bucketed input is 3-D
+#    (B, L, H), which makes core_attn_out come out as (B, ...) while
+#    z keeps the (B, L, ...) prefix, causing a broadcast mismatch in
+#    self.norm(core_attn_out, z).
+#
+#    We flatten both hidden_states and output to 2-D before delegating
+#    to upstream. output.view(...) shares storage so in-place writes
+#    inside upstream propagate back to the caller's 3-D buffer.
+# ====================================================================
+def _hpu_gdn_forward_cuda(self, hidden_states, output):
+    is_3d = (hidden_states is not None and output is not None and hidden_states.dim() == 3 and output.dim() == 3)
+    if not is_3d:
+        return _orig_gdn_forward_cuda(self, hidden_states, output)
+
+    B, L, H = hidden_states.shape
+    hs_2d = hidden_states.reshape(B * L, H)
+    out_2d = output.view(B * L, output.shape[-1])
+    _orig_gdn_forward_cuda(self, hs_2d, out_2d)
+
+
+# ====================================================================
 # Apply all patches
 # ====================================================================
 Qwen3NextAttention.forward = _hpu_qwen3next_attention_forward
 Qwen3NextSparseMoeBlock.forward = _hpu_qwen3next_sparse_moe_forward
+GatedDeltaNetAttention.forward_cuda = _hpu_gdn_forward_cuda
